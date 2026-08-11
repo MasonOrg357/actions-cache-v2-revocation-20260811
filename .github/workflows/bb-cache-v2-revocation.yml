@@ -36,137 +36,170 @@ jobs:
     steps:
       - name: Reserve exact cache-v2 entry
         if: ${{ endsWith(inputs.mode, '-producer') }}
-        shell: bash
-        run: |
-          ruby <<'RUBY'
-          require "digest"
-          require "fileutils"
-          require "json"
-          require "net/http"
-          require "openssl"
-          require "time"
-          require "uri"
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const crypto = require("crypto")
+            const fs = require("fs")
+            const path = require("path")
+            const {spawnSync} = require("child_process")
 
-          mode = ENV.fetch("BB_MODE")
-          run_id = Integer(ENV.fetch("BB_RUN_ID"), 10)
-          abort "mode drift" unless ["control-producer", "candidate-producer"].include?(mode)
-          abort "actor drift" unless ENV.fetch("BB_ACTOR") == "masonghbb"
-          key = mode == "control-producer" ? ENV.fetch("BB_CONTROL_KEY") : ENV.fetch("BB_CANDIDATE_KEY")
-          marker = mode == "control-producer" ? ENV.fetch("BB_CONTROL_MARKER") : ENV.fetch("BB_CANDIDATE_MARKER")
-          marker = marker + "\n"
-          version = ENV.fetch("BB_CACHE_VERSION")
-          abort "cache version drift" unless version.match?(/\A[0-9a-f]{64}\z/)
-          handoff = File.join(ENV.fetch("BB_HANDOFF_ROOT"), mode)
-          FileUtils.mkdir_p(handoff, mode: 0o700)
-          File.chmod(0o700, handoff)
-          capsule_path = File.join(handoff, "capsule.json")
-          ready_path = File.join(handoff, "ready.json")
-          failure_path = File.join(handoff, "failure.json")
-          release_path = File.join(handoff, "release.json")
-          abort "stale handoff" if [capsule_path, ready_path, failure_path, release_path].any? { |item| File.exist?(item) }
+            process.umask(0o077)
+            const mode = process.env.BB_MODE
+            const runId = Number(process.env.BB_RUN_ID)
+            if (!["control-producer", "candidate-producer"].includes(mode)) throw new Error("mode drift")
+            if (process.env.BB_ACTOR !== "masonghbb") throw new Error("actor drift")
+            if (!Number.isSafeInteger(runId) || runId <= 0) throw new Error("run ID drift")
+            const key = mode === "control-producer" ? process.env.BB_CONTROL_KEY : process.env.BB_CANDIDATE_KEY
+            const markerValue = mode === "control-producer" ? process.env.BB_CONTROL_MARKER : process.env.BB_CANDIDATE_MARKER
+            const marker = markerValue + "\n"
+            const version = process.env.BB_CACHE_VERSION
+            if (!/^[0-9a-f]{64}$/.test(version)) throw new Error("cache version drift")
+            const handoff = path.join(process.env.BB_HANDOFF_ROOT, mode)
+            fs.mkdirSync(handoff, {recursive: true, mode: 0o700})
+            fs.chmodSync(handoff, 0o700)
+            const capsulePath = path.join(handoff, "capsule.json")
+            const readyPath = path.join(handoff, "ready.json")
+            const failurePath = path.join(handoff, "failure.json")
+            const releasePath = path.join(handoff, "release.json")
+            const manifestPath = path.join(handoff, "manifest.txt")
+            const archivePath = path.join(handoff, "cache.tgz")
+            const requestPath = path.join(handoff, "create-request.json")
+            const responsePath = path.join(handoff, "create-response.json")
+            const configPath = path.join(handoff, "create-curl.conf")
+            const guardedPaths = [capsulePath, readyPath, failurePath, releasePath, requestPath, responsePath, configPath]
+            if (guardedPaths.some(item => fs.existsSync(item))) throw new Error("stale handoff")
 
-          workspace = ENV.fetch("GITHUB_WORKSPACE")
-          payload = File.join(workspace, "bb-cache-v2-payload")
-          FileUtils.mkdir_p(payload)
-          marker_path = File.join(payload, "marker.txt")
-          File.write(marker_path, marker, mode: "w", perm: 0o600)
-          manifest = File.join(handoff, "manifest.txt")
-          File.write(manifest, "bb-cache-v2-payload\n", mode: "w", perm: 0o600)
-          archive = File.join(handoff, "cache.tgz")
-          command = [
-            "/usr/bin/tar", "--posix", "-czf", archive,
-            "-P", "-C", workspace, "--files-from", manifest
-          ]
-          abort "archive creation failed" unless system(*command, out: File::NULL, err: File::NULL)
-          archive_size = File.size(archive)
-          abort "archive size drift" unless archive_size.positive? && archive_size < 1_048_576
+            const writeFailure = (stage, status) => {
+              fs.writeFileSync(failurePath, JSON.stringify({stage, status}) + "\n", {mode: 0o600})
+            }
+            const scrubFile = file => {
+              if (!fs.existsSync(file)) return
+              fs.writeFileSync(file, Buffer.alloc(fs.statSync(file).size), {mode: 0o600})
+              fs.unlinkSync(file)
+            }
+            const quoteConfig = value => String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+            let stage = "ProducerAction"
+            try {
+              const workspace = process.env.GITHUB_WORKSPACE
+              const payload = path.join(workspace, "bb-cache-v2-payload")
+              fs.mkdirSync(payload, {recursive: true})
+              fs.writeFileSync(path.join(payload, "marker.txt"), marker, {mode: 0o600})
+              fs.writeFileSync(manifestPath, "bb-cache-v2-payload\n", {mode: 0o600})
+              const tar = spawnSync(
+                "/usr/bin/tar",
+                ["--posix", "-czf", archivePath, "-P", "-C", workspace, "--files-from", manifestPath],
+                {stdio: "ignore"}
+              )
+              if (tar.status !== 0) throw new Error("archive creation failed")
+              const archiveSize = fs.statSync(archivePath).size
+              if (archiveSize <= 0 || archiveSize >= 1_048_576) throw new Error("archive size drift")
 
-          results = URI("https://results-receiver.actions.githubusercontent.com/")
-          abort "results URL drift" unless results.is_a?(URI::HTTPS) &&
-                                            results.userinfo.nil? && results.fragment.nil? &&
-                                            results.port == 443 &&
-                                            results.host.to_s.end_with?(".actions.githubusercontent.com")
-          create_uri = URI(results.scheme + "://" + results.host + "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry")
-          request_body = JSON.generate("key" => key, "version" => version)
-          request = Net::HTTP::Post.new(create_uri.request_uri)
-          request["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-          request["Content-Type"] = "application/json"
-          request["Authorization"] = "Bearer " + ENV.fetch("ACTIONS_RUNTIME_TOKEN")
-          request.body = request_body
-          requested_at = Time.now.utc
-          http = Net::HTTP::Proxy("127.0.0.1", 8083).new(create_uri.host, create_uri.port)
-          http.use_ssl = true
-          http.verify_mode = OpenSSL::SSL::VERIFY_NONE
-          http.open_timeout = 15
-          http.read_timeout = 30
-          response = http.request(request)
-          code = response.code.to_i
-          unless code == 200
-            File.write(
-              failure_path,
-              JSON.generate("stage" => "CreateCacheEntry", "status" => code) + "\n",
-              mode: "w",
-              perm: 0o600
-            )
-            abort "CreateCacheEntry failed"
-          end
-          body = JSON.parse(response.body)
-          signed_upload_url = body["signedUploadUrl"]
-          upload = URI(signed_upload_url.to_s)
-          abort "signed upload URL drift" unless body["ok"] == true &&
-                                                  upload.is_a?(URI::HTTPS) &&
-                                                  upload.userinfo.nil? && upload.fragment.nil? &&
-                                                  upload.port == 443 &&
-                                                  upload.host.to_s.end_with?(".blob.core.windows.net") &&
-                                                  !upload.query.to_s.empty?
-          capsule = {
-            "mode" => mode,
-            "run_id" => run_id,
-            "key" => key,
-            "version" => version,
-            "marker_sha256" => Digest::SHA256.hexdigest(marker),
-            "archive_path" => archive,
-            "archive_size" => archive_size,
-            "archive_sha256" => Digest::SHA256.file(archive).hexdigest,
-            "results_url" => results.scheme + "://" + results.host + "/",
-            "runtime_token" => ENV.fetch("ACTIONS_RUNTIME_TOKEN"),
-            "signed_upload_url" => signed_upload_url
-          }
-          temporary = capsule_path + ".tmp-" + Process.pid.to_s
-          File.write(temporary, JSON.generate(capsule) + "\n", mode: "w", perm: 0o600)
-          File.rename(temporary, capsule_path)
-          request["Authorization"] = "[REDACTED]"
-          request_body.replace("0" * request_body.bytesize)
-          signed_upload_url.replace("0" * signed_upload_url.bytesize)
-          body.clear
-          ready = {
-            "mode" => mode,
-            "run_id" => run_id,
-            "key_sha256" => Digest::SHA256.hexdigest(key),
-            "version" => version,
-            "archive_size" => archive_size,
-            "archive_sha256" => capsule["archive_sha256"],
-            "create_status" => code,
-            "create_host" => create_uri.host,
-            "create_path" => create_uri.path,
-            "requested_at" => requested_at.iso8601(6),
-            "runtime_token_output" => false,
-            "signed_url_output" => false
-          }
-          File.write(ready_path, JSON.generate(ready) + "\n", mode: "w", perm: 0o600)
-          loop do
-            if File.file?(release_path)
-              release = JSON.parse(File.read(release_path))
-              abort "release drift" unless release == {
-                "mode" => mode,
-                "run_id" => run_id,
-                "disposition" => "finalized"
+              stage = "ActionRuntimeContext"
+              const runtimeToken = process.env.ACTIONS_RUNTIME_TOKEN
+              const resultsValue = process.env.ACTIONS_RESULTS_URL
+              if (typeof runtimeToken !== "string" || runtimeToken.length < 50) throw new Error("runtime token missing")
+              if (typeof resultsValue !== "string") throw new Error("results URL missing")
+              const results = new URL(resultsValue)
+              if (
+                results.protocol !== "https:" || results.username || results.password ||
+                results.port || results.hostname !== "results-receiver.actions.githubusercontent.com" ||
+                results.pathname !== "/" || results.search || results.hash || results.toString() !== "https://results-receiver.actions.githubusercontent.com/"
+              ) throw new Error("results URL drift")
+              const createUrl = new URL("/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry", results)
+              const requestBody = JSON.stringify({key, version})
+              fs.writeFileSync(requestPath, requestBody, {mode: 0o600})
+              const config = [
+                'proxy = "http://127.0.0.1:8083"',
+                "insecure",
+                "silent",
+                "show-error",
+                "max-time = 30",
+                'request = "POST"',
+                `url = "${quoteConfig(createUrl.toString())}"`,
+                'header = "Content-Type: application/json"',
+                'header = "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"',
+                `header = "Authorization: Bearer ${quoteConfig(runtimeToken)}"`,
+                `data-binary = "@${quoteConfig(requestPath)}"`,
+                `output = "${quoteConfig(responsePath)}"`,
+                'write-out = "%{http_code}"'
+              ].join("\n") + "\n"
+              fs.writeFileSync(configPath, config, {mode: 0o600})
+              const childEnvironment = {...process.env}
+              delete childEnvironment.ACTIONS_RUNTIME_TOKEN
+              const requestedAt = new Date().toISOString()
+              stage = "CreateCacheEntryTransport"
+              const curl = spawnSync(
+                "/usr/bin/curl",
+                ["--config", configPath],
+                {encoding: "utf8", env: childEnvironment, maxBuffer: 1_048_576}
+              )
+              scrubFile(configPath)
+              if (curl.status !== 0) throw new Error("CreateCacheEntry transport failed")
+              const code = Number(curl.stdout.trim())
+              if (!Number.isInteger(code)) throw new Error("CreateCacheEntry status drift")
+              if (code !== 200) {
+                writeFailure("CreateCacheEntry", code)
+                throw new Error("CreateCacheEntry failed")
               }
-              break
-            end
-            sleep 1
-          end
-          RUBY
+              stage = "CreateCacheEntryResponse"
+              const body = JSON.parse(fs.readFileSync(responsePath, "utf8"))
+              const signedUploadUrl = body.signedUploadUrl
+              const upload = new URL(String(signedUploadUrl))
+              if (
+                body.ok !== true || upload.protocol !== "https:" || upload.username || upload.password ||
+                upload.port || !upload.hostname.endsWith(".blob.core.windows.net") || !upload.search
+              ) throw new Error("signed upload URL drift")
+              const digest = value => crypto.createHash("sha256").update(value).digest("hex")
+              const archiveSha256 = digest(fs.readFileSync(archivePath))
+              const capsule = {
+                mode,
+                run_id: runId,
+                key,
+                version,
+                marker_sha256: digest(marker),
+                archive_path: archivePath,
+                archive_size: archiveSize,
+                archive_sha256: archiveSha256,
+                results_url: results.toString(),
+                runtime_token: runtimeToken,
+                signed_upload_url: signedUploadUrl
+              }
+              const temporary = capsulePath + ".tmp-" + process.pid
+              fs.writeFileSync(temporary, JSON.stringify(capsule) + "\n", {mode: 0o600})
+              fs.renameSync(temporary, capsulePath)
+              scrubFile(responsePath)
+              scrubFile(requestPath)
+              const ready = {
+                mode,
+                run_id: runId,
+                key_sha256: digest(key),
+                version,
+                archive_size: archiveSize,
+                archive_sha256: archiveSha256,
+                create_status: code,
+                create_host: createUrl.hostname,
+                create_path: createUrl.pathname,
+                requested_at: requestedAt,
+                runtime_token_output: false,
+                signed_url_output: false
+              }
+              fs.writeFileSync(readyPath, JSON.stringify(ready) + "\n", {mode: 0o600})
+              const waiter = new Int32Array(new SharedArrayBuffer(4))
+              while (!fs.existsSync(releasePath)) Atomics.wait(waiter, 0, 0, 1000)
+              const release = JSON.parse(fs.readFileSync(releasePath, "utf8"))
+              if (
+                release.mode !== mode || release.run_id !== runId ||
+                release.disposition !== "finalized" || Object.keys(release).length !== 3
+              ) throw new Error("release drift")
+            } catch (error) {
+              scrubFile(configPath)
+              scrubFile(responsePath)
+              scrubFile(requestPath)
+              if (!fs.existsSync(failurePath)) writeFailure(stage, 0)
+              throw new Error("controlled cache-v2 producer failed")
+            }
       - name: Prepare clean consumer workspace
         if: ${{ endsWith(inputs.mode, '-consumer') }}
         shell: bash
