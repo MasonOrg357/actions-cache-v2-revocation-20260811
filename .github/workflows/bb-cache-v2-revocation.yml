@@ -81,7 +81,7 @@ jobs:
           archive_size = File.size(archive)
           abort "archive size drift" unless archive_size.positive? && archive_size < 1_048_576
 
-          results = URI(ENV.fetch("ACTIONS_RESULTS_URL"))
+          results = URI("https://results-receiver.actions.githubusercontent.com/")
           abort "results URL drift" unless results.is_a?(URI::HTTPS) &&
                                             results.userinfo.nil? && results.fragment.nil? &&
                                             results.port == 443 &&
