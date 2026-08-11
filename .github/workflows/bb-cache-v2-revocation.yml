@@ -27,12 +27,12 @@ jobs:
       BB_RUN_ID: ${{ github.run_id }}
       BB_ACTOR: ${{ github.actor }}
       BB_HANDOFF_ROOT: /private/tmp/github-actions-cache-v2-revocation-20260811/c59831ece103
-      BB_CONTROL_KEY: bb-cache-v2-control-20260811-c59831ece103
+      BB_CONTROL_KEY: bb-cache-v2-control-20260811-c59831ece103-g1
       BB_CANDIDATE_KEY: bb-cache-v2-candidate-20260811-c59831ece103
       BB_CACHE_VERSION: 132ee2e5c147914695ce68fb20c26bfb23a41325bd902bef6700bd28c554f697
       BB_CONTROL_MARKER: bb-cache-v2-control-marker:c59831ece103
       BB_CANDIDATE_MARKER: bb-cache-v2-candidate-marker:c59831ece103
-      BB_RESTORE_KEY: ${{ inputs.mode == 'control-consumer' && 'bb-cache-v2-control-20260811-c59831ece103' || 'bb-cache-v2-candidate-20260811-c59831ece103' }}
+      BB_RESTORE_KEY: ${{ inputs.mode == 'control-consumer' && 'bb-cache-v2-control-20260811-c59831ece103-g1' || 'bb-cache-v2-candidate-20260811-c59831ece103' }}
     steps:
       - name: Reserve exact cache-v2 entry
         if: ${{ endsWith(inputs.mode, '-producer') }}
