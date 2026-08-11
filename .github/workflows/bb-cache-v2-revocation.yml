@@ -145,7 +145,7 @@ jobs:
               }
               stage = "CreateCacheEntryResponse"
               const body = JSON.parse(fs.readFileSync(responsePath, "utf8"))
-              const signedUploadUrl = body.signedUploadUrl
+              const signedUploadUrl = body.signed_upload_url
               const upload = new URL(String(signedUploadUrl))
               if (
                 body.ok !== true || upload.protocol !== "https:" || upload.username || upload.password ||
